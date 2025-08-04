@@ -1,0 +1,211 @@
+#include <WiFi.h>
+#include <ArduinoOSCWiFi.h>
+#include <Wire.h>
+#include <Adafruit_MMA8451.h>
+#include <Adafruit_Sensor.h>
+
+// Wi-Fi Credentials
+const char* ap_ssid = "ESP32-AP";
+const char* ap_password = "12345678";
+
+// OSC target 
+const char* targetIP = "192.168.4.2";
+const int targetPort1 = 8000; 
+
+// OSC Client
+OscWiFiClient client;
+
+// Accelerometer MMA8451
+Adafruit_MMA8451 mma = Adafruit_MMA8451();
+
+// Filter parameters
+// Sampling every 10 ms
+const float dt = 0.01;  
+
+// High-pass filter for ~0.1 Hz cutoff
+const float RC_hp = 1.0 / (2.0 * PI * 0.1);  
+const float alpha_hp = RC_hp / (RC_hp + dt);   // High-pass filter coefficient
+
+// Low-pass filter for ~0.5 Hz cutoff
+const float RC_lp = 1.0 / (2.0 * PI * 0.5);
+const float alpha_lp = dt / (RC_lp + dt);        // Low-pass filter coefficient
+
+// Filter state variables for each axis (high-pass and low-pass)
+float hp_x = 0, hp_x_prev = 0, raw_x_prev = 0;
+float bp_x = 0, bp_x_prev = 0;
+
+float hp_y = 0, hp_y_prev = 0, raw_y_prev = 0;
+float bp_y = 0, bp_y_prev = 0;
+
+float hp_z = 0, hp_z_prev = 0, raw_z_prev = 0;
+float bp_z = 0, bp_z_prev = 0;
+
+// Moving average filter on the filtered signals
+#define MA_WINDOW 25
+float maBufferX[MA_WINDOW] = {0};
+float maBufferY[MA_WINDOW] = {0};
+float maBufferZ[MA_WINDOW] = {0};
+int maIndex = 0;   // Circular buffer index
+int maCount = 0;   // Number of accumulated samples (max MA_WINDOW)
+
+// Buffers for moving average filter on derivative data
+float slopeBufferX[MA_WINDOW] = {0};
+float slopeBufferY[MA_WINDOW] = {0};
+float slopeBufferZ[MA_WINDOW] = {0};
+int slopeIndex = 0;
+int slopeCount = 0;
+
+// Function to compute the derivative using linear regression
+// Samples have uniform time intervals: t[i] = i*dt, for i=0,...,count-1.
+// startIndex indicates the index of the oldest sample in the circular buffer.
+float computeSlope(float *buffer, int count, int startIndex) {
+  if (count < 2) return 0.0;
+  float sum = 0;
+  for (int i = 0; i < count; i++){
+    int idx = (startIndex + i) % MA_WINDOW;
+    sum += buffer[idx];
+  }
+  float mean_y = sum / count;
+  float mean_t = (count - 1) * dt / 2.0;
+  float num = 0, den = 0;
+  for (int i = 0; i < count; i++){
+    float t = i * dt;
+    int idx = (startIndex + i) % MA_WINDOW;
+    float diff_y = buffer[idx] - mean_y;
+    num += (t - mean_t) * diff_y;
+    den += (t - mean_t) * (t - mean_t);
+  }
+  if (den == 0) return 0.0;
+  return num / den;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Set the ESP32 as Access Point
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  Serial.print("Access Point active: ");
+  Serial.println(ap_ssid);
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // MMA8451 initialization
+  if (!mma.begin()) {
+    Serial.println("MMA8451 not found. Check wiring!");
+    while (1);
+  }
+  Serial.println("MMA8451 initialized.");
+  mma.setRange(MMA8451_RANGE_2_G);
+}
+
+void loop() {
+  // Acquire raw data from the accelerometer
+  mma.read();
+  float rawX = mma.x / 4096.0;
+  float rawY = mma.y / 4096.0;
+  float rawZ = mma.z / 4096.0;
+
+  // High-pass filter: hp[n] = alpha_hp * (hp[n-1] + x[n] - x[n-1])
+  hp_x = alpha_hp * (hp_x_prev + rawX - raw_x_prev);
+  hp_y = alpha_hp * (hp_y_prev + rawY - raw_y_prev);
+  hp_z = alpha_hp * (hp_z_prev + rawZ - raw_z_prev);
+
+  // Update previous values for high-pass
+  raw_x_prev = rawX;
+  raw_y_prev = rawY;
+  raw_z_prev = rawZ;
+  
+  hp_x_prev = hp_x;
+  hp_y_prev = hp_y;
+  hp_z_prev = hp_z;
+
+  // Low-pass filter: bp[n] = alpha_lp * hp[n] + (1 - alpha_lp) * bp[n-1]
+  bp_x = alpha_lp * hp_x + (1 - alpha_lp) * bp_x_prev;
+  bp_y = alpha_lp * hp_y + (1 - alpha_lp) * bp_y_prev;
+  bp_z = alpha_lp * hp_z + (1 - alpha_lp) * bp_z_prev;
+
+  bp_x_prev = bp_x;
+  bp_y_prev = bp_y;
+  bp_z_prev = bp_z;
+
+  // Now bp_x, bp_y, bp_z are the band-pass filtered signals
+  // Apply moving average filter on the filtered signal
+  maBufferX[maIndex] = bp_x;
+  maBufferY[maIndex] = bp_y;
+  maBufferZ[maIndex] = bp_z;
+  
+  maIndex = (maIndex + 1) % MA_WINDOW;
+  if (maCount < MA_WINDOW) {
+    maCount++;
+  }
+  
+  float sumX = 0, sumY = 0, sumZ = 0;
+  for (int i = 0; i < maCount; i++) {
+    sumX += maBufferX[i];
+    sumY += maBufferY[i];
+    sumZ += maBufferZ[i];
+  }
+  
+  float ma_x = sumX / maCount;
+  float ma_y = sumY / maCount;
+  float ma_z = sumZ / maCount;
+
+  // Determine the index of the oldest sample in the moving average buffer
+  int startIndex = (maCount < MA_WINDOW) ? 0 : maIndex;
+
+  // Compute the derivative (slope) using linear regression over the moving average samples
+  float slope_x = computeSlope(maBufferX, maCount, startIndex);
+  float slope_y = computeSlope(maBufferY, maCount, startIndex);
+  float slope_z = computeSlope(maBufferZ, maCount, startIndex);
+
+  // Apply moving average filter also on the derivative data
+  slopeBufferX[slopeIndex] = slope_x;
+  slopeBufferY[slopeIndex] = slope_y;
+  slopeBufferZ[slopeIndex] = slope_z;
+  
+  slopeIndex = (slopeIndex + 1) % MA_WINDOW;
+  if (slopeCount < MA_WINDOW) {
+    slopeCount++;
+  }
+  
+  float sumSlopeX = 0, sumSlopeY = 0, sumSlopeZ = 0;
+  for (int i = 0; i < slopeCount; i++) {
+    sumSlopeX += slopeBufferX[i];
+    sumSlopeY += slopeBufferY[i];
+    sumSlopeZ += slopeBufferZ[i];
+  }
+  
+  float ma_slope_x = sumSlopeX / slopeCount;
+  float ma_slope_y = sumSlopeY / slopeCount;
+  float ma_slope_z = sumSlopeZ / slopeCount;
+
+  // Clipping and normalization
+  // Clipping and normalization for accelerometer signals:
+  // Clipping between -0.5 and 0.5, normalization: (x + 0.5) / 1.0
+  float clipped_x = constrain(ma_x, -0.5, 0.5);
+  float norm_x = (clipped_x + 0.5);  // Range 0 - 1
+  
+  float clipped_y = constrain(ma_y, -0.5, 0.5);
+  float norm_y = (clipped_y + 0.5);
+  
+  float clipped_z = constrain(ma_z, -0.5, 0.5);
+  float norm_z = (clipped_z + 0.5);
+
+  // Clipping and normalization for derivative data:
+  // Clipping between -2 and 2, normalization: (x + 2) / 4
+  float clipped_slope_x = constrain(ma_slope_x, -2.0, 2.0);
+  float norm_slope_x = (clipped_slope_x + 2.0) / 4.0;
+  
+  float clipped_slope_y = constrain(ma_slope_y, -2.0, 2.0);
+  float norm_slope_y = (clipped_slope_y + 2.0) / 4.0;
+  
+  float clipped_slope_z = constrain(ma_slope_z, -2.0, 2.0);
+  float norm_slope_z = (clipped_slope_z + 2.0) / 4.0;
+
+  // Send final normalized values via OSC:
+  // The OSC message contains 6 values: norm_x, norm_y, norm_z, norm_slope_x, norm_slope_y, norm_slope_z
+  client.send(targetIP, targetPort1, "/accelerometer", norm_x, norm_y, norm_z, norm_slope_x, norm_slope_y, norm_slope_z);
+
+  delay(10);
+}
